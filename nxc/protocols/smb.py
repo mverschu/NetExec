@@ -2334,26 +2334,54 @@ class smb(connection):
                 secret = " ".join(secret.split(" ")[:-1]) if " " in secret else secret
                 self.logger.highlight(secret)
 
-            # Filter out computer accounts, history hashes and kerberos keys for adding to db
-            if secret.find("$") == -1 and secret_type == NTDSHashes.SECRET_TYPE.NTDS and "_history" not in secret:
-                if secret.find("\\") != -1:
-                    domain, clean_hash = secret.split("\\")
-                else:
-                    domain = self.domain
-                    clean_hash = secret
+            # Filter out computer accounts and history hashes for adding to db
+            if secret.find("$") == -1 and "_history" not in secret:
+                if secret_type == NTDSHashes.SECRET_TYPE.NTDS:
+                    # Handle NTLM hashes
+                    if secret.find("\\") != -1:
+                        domain, clean_hash = secret.split("\\")
+                    else:
+                        domain = self.domain
+                        clean_hash = secret
 
-                try:
-                    username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
-                    parsed_hash = f"{lmhash}:{nthash}"
-                    if validate_ntlm(parsed_hash):
-                        self.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
-                        add_hash.added_to_db += 1
-                        return
-                    raise
-                except Exception:
-                    self.logger.debug("Dumped hash is not NTLM, not adding to db for now ;)")
+                    try:
+                        username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
+                        parsed_hash = f"{lmhash}:{nthash}"
+                        if validate_ntlm(parsed_hash):
+                            self.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
+                            add_hash.added_to_db += 1
+                            return
+                        raise
+                    except Exception:
+                        self.logger.debug("Dumped hash is not NTLM, not adding to db for now ;)")
+                elif secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                    # Handle Kerberos keys (AES256, AES128, etc.)
+                    try:
+                        # Parse Kerberos secret format: domain\username:encryption_type:key or username:encryption_type:key
+                        if secret.find("\\") != -1:
+                            domain, rest = secret.split("\\", 1)
+                        else:
+                            domain = self.domain
+                            rest = secret
+                        
+                        # Extract encryption type and key
+                        secret_lower = secret.lower()
+                        if "aes256-cts-hmac-sha1-96" in secret_lower:
+                            # Format: domain\username:aes256-cts-hmac-sha1-96:key
+                            key = rest.split(":")[-1]
+                            username = rest.split(":")[0]
+                            self.db.add_credential("aes256", domain, username, key, pillaged_from=host_id)
+                            add_hash.added_to_db += 1
+                        elif "aes128-cts-hmac-sha1-96" in secret_lower:
+                            # Format: domain\username:aes128-cts-hmac-sha1-96:key
+                            key = rest.split(":")[-1]
+                            username = rest.split(":")[0]
+                            self.db.add_credential("aes128", domain, username, key, pillaged_from=host_id)
+                            add_hash.added_to_db += 1
+                    except Exception as e:
+                        self.logger.debug(f"Error parsing Kerberos secret: {e}")
             else:
-                self.logger.debug("Dumped hash is a computer account, not adding to db")
+                self.logger.debug("Dumped secret is a computer account, not adding to db")
 
         add_hash.nt_lm_secrets = 0
         add_hash.kerb_secrets = 0
@@ -2377,7 +2405,7 @@ class smb(connection):
             noLMHash=True,
             remoteOps=self.remote_ops,
             useVSSMethod=use_vss_method,
-            justNTLM=not self.args.kerberos_keys,
+            justNTLM=False,
             pwdLastSet=False,
             resumeSession=None,
             outputFileName=self.output_filename,
@@ -2390,9 +2418,8 @@ class smb(connection):
             self.logger.success("Dumping the NTDS, this could take a while so go grab a redbull...")
             NTDS.dump()
             ntds_outfile = f"{self.output_filename}.ntds"
-            self.logger.success(f"Dumped {highlight(add_hash.nt_lm_secrets)} NTDS hashes to {ntds_outfile} of which {highlight(add_hash.added_to_db)} were added to the database")
-            if self.args.kerberos_keys:
-                self.logger.success(f"Dumped {highlight(add_hash.kerb_secrets)} Kerberos keys to {ntds_outfile}.kerberos")
+            total_secrets = add_hash.nt_lm_secrets + add_hash.kerb_secrets
+            self.logger.success(f"Dumped {highlight(total_secrets)} NTDS secrets ({highlight(add_hash.nt_lm_secrets)} NTLM hashes, {highlight(add_hash.kerb_secrets)} Kerberos keys) to {ntds_outfile} of which {highlight(add_hash.added_to_db)} were added to the database")
             self.logger.display("To extract only enabled accounts from the output file, run the following command: ")
             self.logger.display(f"grep -iv disabled {ntds_outfile} | cut -d ':' -f1")
         except Exception as e:
